@@ -1,0 +1,11 @@
+sentence-transformers for chunk-level semantic search
+
+llama-cpp-python to run a local LLM (TinyLlama)
+
+FastAPI to wrap it all into a clean API
+
+/search endpoint that combines retrieval + generation
+
+Swagger UI working 
+
+Embeddings + chunking already preprocessed 
