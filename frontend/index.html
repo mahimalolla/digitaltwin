@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Warren Buffett Digital Twin</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- [Styles omitted for brevity] -->
+</head>
+<body class="bg-gray-50">
+<div id="app"></div>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+
+<script type="text/babel">
+    const { useState, useEffect } = React;
+
+    const BuffettDigitalTwin = () => {
+        const [messages, setMessages] = useState([]);
+        const [inputMessage, setInputMessage] = useState('');
+        const [isTyping, setIsTyping] = useState(false);
+
+        const handleSendMessage = () => {
+            if (!inputMessage.trim()) return;
+
+            const userMessage = {
+                id: messages.length + 1,
+                type: 'user',
+                content: inputMessage
+            };
+
+            setMessages(prev => [...prev, userMessage]);
+            setInputMessage('');
+            setIsTyping(true);
+
+            fetch("http://localhost:8000/search", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ query: inputMessage })
+            })
+            .then(res => {
+                if (!res.ok) throw new Error("Backend error");
+                return res.json();
+            })
+            .then(data => {
+                setMessages(prev => [...prev, {
+                    id: prev.length + 1,
+                    type: 'assistant',
+                    content: data.answer,
+                    sources: data.results?.map(r => r.source) || []
+                }]);
+            })
+            .catch(err => {
+                console.error("Error fetching answer:", err);
+                setMessages(prev => [...prev, {
+                    id: prev.length + 1,
+                    type: 'assistant',
+                    content: "Sorry, something went wrong while fetching the answer.",
+                    sources: []
+                }]);
+            })
+            .finally(() => setIsTyping(false));
+        };
+
+        return (
+            <div className="min-h-screen bg-gray-50 p-4">
+                <div className="max-w-3xl mx-auto space-y-4">
+                    <h1 className="text-2xl font-bold">Buffett Digital Twin</h1>
+                    <div className="border p-4 rounded bg-white shadow">
+                        <div className="space-y-3">
+                            {messages.map(msg => (
+                                <div key={msg.id} className={`p-3 rounded ${msg.type === 'user' ? 'bg-blue-100 text-right' : 'bg-gray-100 text-left'}`}>
+                                    <p>{msg.content}</p>
+                                    {msg.sources && msg.sources.length > 0 && (
+                                        <div className="text-xs text-gray-500 mt-2">
+                                            Sources: {msg.sources.join(', ')}
+                                        </div>
+                                    )}
+                                </div>
+                            ))}
+                            {isTyping && <p className="italic text-gray-400">Buffett Twin is typing...</p>}
+                        </div>
+                        <div className="mt-4 flex">
+                            <input
+                                type="text"
+                                value={inputMessage}
+                                onChange={(e) => setInputMessage(e.target.value)}
+                                onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
+                                placeholder="Ask Warren about investing..."
+                                className="flex-1 border px-3 py-2 rounded-l"
+                            />
+                            <button
+                                onClick={handleSendMessage}
+                                className="bg-blue-600 text-white px-4 py-2 rounded-r hover:bg-blue-700"
+                                disabled={!inputMessage.trim()}
+                            >Send</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
+    ReactDOM.render(<BuffettDigitalTwin />, document.getElementById('app'));
+</script>
+</body>
+</html>
+
