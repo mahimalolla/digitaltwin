@@ -1,6 +1,6 @@
 # search_api.py
 # -----------------------------------------
-# Warren Buffett Digital Twin - Backend API (demo-friendly)
+# Warren Buffett Digital Twin - Backend API (demo-friendly, hardened)
 # -----------------------------------------
 # Endpoints:
 #   GET  /health, /healthz
@@ -13,16 +13,27 @@
 # - Name->ticker resolution prefers an OFFLINE map first (so demos work without internet).
 # - Fundamentals: try yfinance; if it fails and DEMO_MODE=True, fall back to demo numbers.
 # - Price history: try yfinance; else generate a synthetic sparkline.
+# - RAG: if embeddings/model aren’t available, we still answer using LLaMA (empty context).
+# -----------------------------------------
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
-import json, torch, math, random, time
+import json, os, math, random
+import warnings
+
+# Silence noisy deps for cleaner logs
+warnings.filterwarnings("ignore")
 
 # ---------- RAG / LLM ----------
-from sentence_transformers import SentenceTransformer, util
+try:
+    from sentence_transformers import SentenceTransformer, util  # type: ignore
+except Exception:
+    SentenceTransformer = None  # type: ignore
+    util = None  # type: ignore
+
 from llama_cpp import Llama
 
 # ---------- Fundamentals ----------
@@ -77,10 +88,10 @@ DEMO_FUNDAMENTALS = {
 # ====================================================
 # FastAPI app
 # ====================================================
-app = FastAPI(title="Investment Digital Twin API", version="1.1.0")
+app = FastAPI(title="Investment Digital Twin API", version="1.1.1")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # demo-friendly
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -92,35 +103,71 @@ def health():
     return {"ok": True}
 
 # ====================================================
-# RAG pieces
+# RAG pieces (lazy + resilient)
 # ====================================================
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
+# Embeddings store (optional)
 docs: List[dict] = []
-embeddings: List[List[float]] = []
-emb_path = Path("data/final/embeddings.jsonl")
-if emb_path.exists() and emb_path.stat().st_size > 0:
-    with emb_path.open("r", encoding="utf-8") as f:
+corpus_embeddings = None  # torch tensor or None
+
+EMB_PATH = Path("data/final/embeddings.jsonl")
+
+# Sentence model (optional, only used if embeddings file is present)
+_st_model = None
+_st_err: Optional[str] = None
+
+def _load_sentence_model():
+    global _st_model, _st_err
+    if _st_model is not None or _st_err:
+        return
+    if SentenceTransformer is None:
+        _st_err = "sentence-transformers not available"
+        return
+    try:
+        # Small, fast model
+        _st_model = SentenceTransformer("all-MiniLM-L6-v2")
+    except Exception as e:
+        _st_err = f"embed model load failed: {e}"
+
+def _load_embeddings():
+    """Load embeddings.jsonl if present. Safe to call multiple times."""
+    global docs, corpus_embeddings
+    if corpus_embeddings is not None or not EMB_PATH.exists() or EMB_PATH.stat().st_size == 0:
+        return
+    with EMB_PATH.open("r", encoding="utf-8") as f:
+        embs = []
         for line in f:
             obj = json.loads(line)
             docs.append(obj)
-            embeddings.append(obj["embedding"])
-    corpus_embeddings = torch.tensor(embeddings) if embeddings else None
-else:
-    corpus_embeddings = None
+            embs.append(obj["embedding"])
+    # Deferred import to avoid torch hard dep when not needed
+    import torch # type: ignore
+    corpus_embeddings = torch.tensor(embs, dtype=torch.float32) if embs else None
 
-LLM_PATH = "model/llms/tinyllama-1.1b-chat-v1.0.Q2_K.gguf"
+# LLaMA (required for /search to answer)
+LLM_PATH = os.getenv("LLAMA_PATH", "model/llms/tinyllama-1.1b-chat-v1.0.Q2_K.gguf")
 CTX_SIZE = 2048
 MAX_NEW_TOKENS = 256
 TOKEN_CHAR_RATIO = 4.0
 SAFETY_MARGIN = 64
 
-_llm = None
-_llm_err = None
-try:
-    _llm = Llama(model_path=LLM_PATH, n_ctx=CTX_SIZE, n_threads=4, n_gpu_layers=0, verbose=False)
-except Exception as e:
-    _llm_err = str(e)
+_llm: Optional[Llama] = None
+_llm_err: Optional[str] = None
+
+def _load_llm():
+    global _llm, _llm_err
+    if _llm is not None or _llm_err:
+        return
+    try:
+        # Keep it CPU-safe for Windows demos
+        _llm = Llama(
+            model_path=LLM_PATH,
+            n_ctx=CTX_SIZE,
+            n_threads=4,
+            n_gpu_layers=0,
+            verbose=False,
+        )
+    except Exception as e:
+        _llm_err = str(e)
 
 class QueryIn(BaseModel):
     query: str = Field(..., description="Natural-language question")
@@ -137,10 +184,14 @@ def _trim_context_for_ctx(query: str, context: str) -> str:
     allowed_ctx_chars = int(allowed_ctx_tokens * TOKEN_CHAR_RATIO)
     return context[: max(0, allowed_ctx_chars)]
 
-def generate_answer(query: str, context: str) -> str:
+def _llm_answer(prompt: str, max_tokens: int = MAX_NEW_TOKENS) -> str:
     if _llm is None:
-        raise HTTPException(status_code=503, detail=f"LLM not available: {LLM_PATH} ({_llm_err or 'init error'})")
-    trimmed = _trim_context_for_ctx(query, context)
+        raise HTTPException(status_code=503, detail=f"LLM not available at {LLM_PATH}: {_llm_err or 'init error'}")
+    out = _llm(prompt, max_tokens=max_tokens, temperature=0.2, stop=["</s>"])
+    return out["choices"][0]["text"].strip()
+
+def generate_answer(query: str, context: str) -> str:
+    trimmed = _trim_context_for_ctx(query, context or "")
     prompt = f"""You are Warren Buffett's financial digital twin.
 
 Use the following context to answer concisely and cite key ideas when helpful.
@@ -153,27 +204,41 @@ Question:
 
 Answer:"""
     try:
-        out = _llm(prompt, max_tokens=MAX_NEW_TOKENS, temperature=0.2, stop=["</s>"])
-        return out["choices"][0]["text"].strip()
+        return _llm_answer(prompt, MAX_NEW_TOKENS)
     except Exception:
-        trimmed = trimmed[: max(0, int(len(trimmed) * 0.6))]
-        out = _llm(prompt, max_tokens=min(128, MAX_NEW_TOKENS), temperature=0.2, stop=["</s>"])
-        return out["choices"][0]["text"].strip()
+        # last-ditch: shorten further
+        shorter = trimmed[: max(0, int(len(trimmed) * 0.6))]
+        prompt = prompt.replace(trimmed, shorter)
+        return _llm_answer(prompt, min(128, MAX_NEW_TOKENS))
 
 @app.post("/search")
 def search_chunks(query: QueryIn):
-    if not query.query:
-        raise HTTPException(status_code=400, detail="Query text is required.")
-    if corpus_embeddings is None or not docs:
-        raise HTTPException(status_code=503, detail="RAG corpus not loaded. Build data/final/embeddings.jsonl first.")
-    q_emb = model.encode(query.query, convert_to_tensor=True)
-    hits = util.semantic_search(q_emb, corpus_embeddings, top_k=5)[0]
-    top_results = []
-    for h in hits:
-        idx = int(h["corpus_id"])
-        doc = docs[idx] if 0 <= idx < len(docs) else {"text": "", "source": ""}
-        top_results.append({"score": round(float(h.get("score", 0.0)), 4), "source": doc.get("source", ""), "text": doc.get("text", "")})
-    context = "\n".join(d["text"] for d in top_results if d["text"])
+    _load_llm()
+    _load_embeddings()
+    # If we have embeddings + sentence model, do retrieval; else answer without context
+    context = ""
+    top_results: List[Dict] = []
+
+    if corpus_embeddings is not None and SentenceTransformer is not None:
+        _load_sentence_model()
+        if _st_model is not None and util is not None:
+            try:
+                q_emb = _st_model.encode(query.query, convert_to_tensor=True)
+                hits = util.semantic_search(q_emb, corpus_embeddings, top_k=5)[0]
+                for h in hits:
+                    idx = int(h["corpus_id"])
+                    doc = docs[idx] if 0 <= idx < len(docs) else {"text": "", "source": ""}
+                    top_results.append({
+                        "score": round(float(h.get("score", 0.0)), 4),
+                        "source": doc.get("source", ""),
+                        "text": doc.get("text", "")
+                    })
+                context = "\n".join(d["text"] for d in top_results if d.get("text"))
+            except Exception:
+                # fall back to no-context if retrieval fails
+                top_results = []
+                context = ""
+
     answer = generate_answer(query.query, context)
     return {"query": query.query, "answer": answer, "results": top_results}
 
@@ -182,14 +247,18 @@ def search_chunks(query: QueryIn):
 # ====================================================
 def _safe_get(series_or_df, key):
     try:
-        return float(series_or_df.loc[key].iloc[0])
+        val = series_or_df.loc[key]
+        if isinstance(val, pd.Series):
+            val = val.dropna().astype(float)
+            return float(val.iloc[0]) if not val.empty else None
+        return float(val)
     except Exception:
         return None
 
 def _graham_intrinsic(eps: Optional[float], growth: Optional[float]) -> Optional[float]:
     if eps is None:
         return None
-    g_pct = (growth or 0.08) * 100
+    g_pct = (growth or 0.08) * 100.0
     Y = 4.4
     return eps * (8.5 + 2 * g_pct) * 4.4 / Y
 
@@ -197,29 +266,47 @@ def score_buffett(m: dict):
     reasons, score = [], 0
     roe, pe, dte, g, price, iv = m["roe"], m["pe"], m["debtToEquity"], m["earningsGrowth"], m["price"], m["intrinsicValue"]
     if roe is not None:
-        if roe >= 0.15: score += 2; reasons.append(f"ROE {roe:.1%} >= 15% (strong)")
-        elif roe >= 0.10: score += 1; reasons.append(f"ROE {roe:.1%} >= 10% (ok)")
-        else: reasons.append(f"ROE {roe:.1%} < 10% (weak)")
+        if roe >= 0.15:
+            score += 2; reasons.append(f"ROE {roe:.1%} >= 15% (strong)")
+        elif roe >= 0.10:
+            score += 1; reasons.append(f"ROE {roe:.1%} >= 10% (ok)")
+        else:
+            reasons.append(f"ROE {roe:.1%} < 10% (weak)")
     if pe is not None:
-        if pe <= 20: score += 2; reasons.append(f"P/E {pe:.1f} <= 20 (reasonable)")
-        elif pe <= 25: score += 1; reasons.append(f"P/E {pe:.1f} <= 25 (borderline)")
-        else: reasons.append(f"P/E {pe:.1f} > 25 (expensive)")
+        if pe <= 20:
+            score += 2; reasons.append(f"P/E {pe:.1f} <= 20 (reasonable)")
+        elif pe <= 25:
+            score += 1; reasons.append(f"P/E {pe:.1f} <= 25 (borderline)")
+        else:
+            reasons.append(f"P/E {pe:.1f} > 25 (expensive)")
     if dte is not None:
-        if dte <= 0.5: score += 2; reasons.append(f"Debt/Equity {dte:.2f} <= 0.5 (conservative)")
-        elif dte <= 1.0: score += 1; reasons.append(f"Debt/Equity {dte:.2f} <= 1.0 (moderate)")
-        else: reasons.append(f"Debt/Equity {dte:.2f} > 1.0 (high)")
+        if dte <= 0.5:
+            score += 2; reasons.append(f"Debt/Equity {dte:.2f} <= 0.5 (conservative)")
+        elif dte <= 1.0:
+            score += 1; reasons.append(f"Debt/Equity {dte:.2f} <= 1.0 (moderate)")
+        else:
+            reasons.append(f"Debt/Equity {dte:.2f} > 1.0 (high)")
     if g is not None:
-        if g >= 0.10: score += 2; reasons.append(f"Earnings growth {g:.1%} >= 10% (healthy)")
-        elif g >= 0.05: score += 1; reasons.append(f"Earnings growth {g:.1%} >= 5% (ok)")
-        else: reasons.append(f"Earnings growth {g:.1%} < 5% (low)")
+        if g >= 0.10:
+            score += 2; reasons.append(f"Earnings growth {g:.1%} >= 10% (healthy)")
+        elif g >= 0.05:
+            score += 1; reasons.append(f"Earnings growth {g:.1%} >= 5% (ok)")
+        else:
+            reasons.append(f"Earnings growth {g:.1%} < 5% (low)")
     if iv is not None and price is not None and price != 0:
         margin = (iv - price) / price
-        if margin >= 0.25: score += 2; reasons.append(f"Price below intrinsic by {margin:.0%} (value)")
-        elif margin >= 0.0: score += 1; reasons.append("Near intrinsic (fair)")
-        else: reasons.append(f"Above intrinsic by {abs(margin):.0%} (premium)")
-    if score >= 8: label, color = "Likely Buy", "green"
-    elif score >= 5: label, color = "Hold / Watchlist", "yellow"
-    else: label, color = "Avoid / Too Expensive", "red"
+        if margin >= 0.25:
+            score += 2; reasons.append(f"Price below intrinsic by {margin:.0%} (value)")
+        elif margin >= 0.0:
+            score += 1; reasons.append("Near intrinsic (fair)")
+        else:
+            reasons.append(f"Above intrinsic by {abs(margin):.0%} (premium)")
+    if score >= 8:
+        label, color = "Likely Buy", "green"
+    elif score >= 5:
+        label, color = "Hold / Watchlist", "yellow"
+    else:
+        label, color = "Avoid / Too Expensive", "red"
     return {"score": score, "label": label, "color": color, "reasons": reasons}
 
 # ====================================================
@@ -228,23 +315,33 @@ def score_buffett(m: dict):
 def compute_metrics_yfinance(ticker: str) -> Optional[Dict]:
     try:
         tk = yf.Ticker(ticker)
-        info = {}
+
+        # company name (robust)
+        company = None
         try:
-            info = tk.get_info()
+            info = tk.get_info() or {}
         except Exception:
             try:
-                info = tk.info
+                info = tk.info or {}
             except Exception:
                 info = {}
         company = info.get("longName") or info.get("shortName") or ticker.upper()
+
+        # financial statements may be empty with recent yfinance changes
         try:
-            inc = tk.financials
-            bal = tk.balance_sheet
+            inc = tk.financials if isinstance(tk.financials, pd.DataFrame) else pd.DataFrame()
         except Exception:
-            inc = pd.DataFrame(); bal = pd.DataFrame()
+            inc = pd.DataFrame()
+        try:
+            bal = tk.balance_sheet if isinstance(tk.balance_sheet, pd.DataFrame) else pd.DataFrame()
+        except Exception:
+            bal = pd.DataFrame()
+
         net_income = _safe_get(inc, "Net Income")
         equity = _safe_get(bal, "Total Stockholder Equity") or _safe_get(bal, "Total Equity Gross Minority Interest")
         total_liab = _safe_get(bal, "Total Liab")
+
+        # fast_info often better for price/shares
         fast = getattr(tk, "fast_info", {}) or {}
         shares = None
         for k in ("sharesOutstanding", "shares_outstanding"):
@@ -259,18 +356,24 @@ def compute_metrics_yfinance(ticker: str) -> Optional[Dict]:
                 shares = float(info.get("sharesOutstanding")) if info.get("sharesOutstanding") else None
             except Exception:
                 shares = None
+
         price = None
         try:
             price = float(fast.get("lastPrice") or fast.get("last_price") or info.get("currentPrice"))
         except Exception:
             price = None
+
         eps = None
         try:
             eps = float(info.get("trailingEps")) if info.get("trailingEps") is not None else None
         except Exception:
             eps = None
         if eps is None and net_income and shares:
-            eps = net_income / shares
+            try:
+                eps = float(net_income) / float(shares)
+            except Exception:
+                eps = None
+
         pe = None
         for k in ("peRatio", "trailingPE"):
             try:
@@ -280,16 +383,29 @@ def compute_metrics_yfinance(ticker: str) -> Optional[Dict]:
             except Exception:
                 pass
         if pe is None and price and eps and eps != 0:
-            pe = price / eps
+            try:
+                pe = float(price) / float(eps)
+            except Exception:
+                pe = None
+
         roe = None
         if net_income is not None and equity not in (None, 0):
-            roe = net_income / equity
+            try:
+                roe = float(net_income) / float(equity)
+            except Exception:
+                roe = None
+
         d_to_e = None
         if total_liab is not None and equity not in (None, 0):
-            d_to_e = total_liab / equity
+            try:
+                d_to_e = float(total_liab) / float(equity)
+            except Exception:
+                d_to_e = None
+
+        # very rough growth proxy from Net Income timeseries if available
         growth = None
         try:
-            if not inc.empty and "Net Income" in inc.index and inc.shape[1] >= 2:
+            if isinstance(inc, pd.DataFrame) and not inc.empty and "Net Income" in inc.index and inc.shape[1] >= 2:
                 ni = inc.loc["Net Income"].dropna().astype(float).sort_index()
                 if len(ni) >= 2:
                     n_years = max(1, len(ni) - 1)
@@ -297,7 +413,8 @@ def compute_metrics_yfinance(ticker: str) -> Optional[Dict]:
                     if start > 0 and end > 0:
                         growth = (end / start) ** (1 / n_years) - 1
         except Exception:
-            pass
+            growth = None
+
         intrinsic = _graham_intrinsic(eps, growth)
         return {
             "company": company,
@@ -338,8 +455,14 @@ YAHOO_SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search"
 
 def _yahoo_search(query: str, quotes_count: int = 8) -> List[dict]:
     try:
-        params = {"q": query.strip(), "quotesCount": quotes_count, "newsCount": 0, "listsCount": 0,
-                  "quotesQueryId": "tss_match_phrase_query", "enableCb": True}
+        params = {
+            "q": query.strip(),
+            "quotesCount": quotes_count,
+            "newsCount": 0,
+            "listsCount": 0,
+            "quotesQueryId": "tss_match_phrase_query",
+            "enableCb": True
+        }
         r = requests.get(YAHOO_SEARCH_URL, params=params, timeout=5)
         r.raise_for_status()
         data = r.json() or {}
@@ -366,7 +489,10 @@ def resolve_company(query: str) -> Optional[Dict]:
     quotes = _yahoo_search(q, quotes_count=10)
     if not quotes:
         return None
-    equities = [c for c in quotes if c.get("symbol") and (c.get("typeDisp") or "").lower() in {"equity", "etf", "mutual fund", "fund"}]
+    equities = [
+        c for c in quotes
+        if c.get("symbol") and (c.get("typeDisp") or "").lower() in {"equity", "etf", "mutual fund", "fund"}
+    ]
     if not equities:
         return None
     q_tokens = set(key.split())
@@ -374,7 +500,8 @@ def resolve_company(query: str) -> Optional[Dict]:
     for c in equities:
         name = (c.get("shortname") or c.get("longname") or "").lower()
         score = 0
-        if key in name: score += 5
+        if key in name:
+            score += 5
         score += len(q_tokens & set(name.split()))
         exch = (c.get("exchDisp") or "").upper()
         if any(x in exch for x in ["NASDAQ", "NYSE", "NSE", "BSE", "LSE", "ASX", "TSX", "HKEX"]):
@@ -382,7 +509,11 @@ def resolve_company(query: str) -> Optional[Dict]:
         scored.append((score, c))
     scored.sort(key=lambda x: x[0], reverse=True)
     best = (scored[0][1] if scored else equities[0])
-    return {"ticker": best["symbol"], "name": best.get("shortname") or best.get("longname") or best["symbol"], "exchange": best.get("exchDisp") or ""}
+    return {
+        "ticker": best["symbol"],
+        "name": best.get("shortname") or best.get("longname") or best["symbol"],
+        "exchange": best.get("exchDisp") or ""
+    }
 
 # ====================================================
 # Autocomplete (uses Yahoo if available; falls back to offline map)
@@ -400,7 +531,8 @@ def autocomplete(q: str = Query(..., min_length=1)):
     if quotes:
         for c in quotes:
             sym = c.get("symbol")
-            if not sym: continue
+            if not sym:
+                continue
             items.append(AutocompleteItem(
                 ticker=sym,
                 name=c.get("shortname") or c.get("longname") or sym,
@@ -500,3 +632,4 @@ def predict(
         "raw": {"price": metrics["price"], "intrinsicValue": metrics["intrinsicValue"], "marginPct": margin_pct},
         "priceHistory": price_history
     }
+
