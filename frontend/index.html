@@ -16,6 +16,59 @@
     .gradient-text{background:linear-gradient(45deg,#3B82F6,#8B5CF6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
     .pulse-hover:hover{animation:pulse .5s ease-in-out}
     @keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}
+
+    /* ---------- Global dark-mode overrides ---------- */
+    html.dark-mode body {
+      background-color: #020617; /* slate-950-ish */
+      color: #e5e7eb;
+    }
+    html.dark-mode .bg-gray-50 { background-color:#020617 !important; }
+    html.dark-mode .bg-white { background-color:#020617 !important; }
+    html.dark-mode .bg-gray-100 { background-color:#0f172a !important; }
+    html.dark-mode .bg-gray-200 { background-color:#111827 !important; }
+    html.dark-mode .border-gray-200 { border-color:#374151 !important; }
+    html.dark-mode .border-gray-300 { border-color:#4b5563 !important; }
+
+    html.dark-mode .text-gray-900 { color:#f9fafb !important; }
+    html.dark-mode .text-gray-800 { color:#e5e7eb !important; }
+    html.dark-mode .text-gray-700 { color:#e5e7eb !important; }
+    html.dark-mode .text-gray-600 { color:#d1d5db !important; }
+    html.dark-mode .text-gray-500 { color:#9ca3af !important; }
+
+    html.dark-mode input,
+    html.dark-mode textarea {
+      background-color:#020617 !important;
+      color:#e5e7eb !important;
+      border-color:#4b5563 !important;
+    }
+    html.dark-mode input::placeholder,
+    html.dark-mode textarea::placeholder {
+      color:#6b7280 !important;
+    }
+
+    html.dark-mode .shadow-lg,
+    html.dark-mode .shadow-sm,
+    html.dark-mode .shadow-2xl {
+      box-shadow: 0 10px 25px rgba(0,0,0,0.7) !important;
+    }
+
+    /* Make suggestion chips / badges look okay in dark */
+    html.dark-mode .bg-gray-100.text-gray-600 {
+      background-color:#111827 !important;
+      color:#e5e7eb !important;
+    }
+    html.dark-mode .bg-blue-50 {
+      background-color:#1d283a !important;
+    }
+    html.dark-mode .bg-green-50 {
+      background-color:#052e16 !important;
+    }
+    html.dark-mode .bg-yellow-50 {
+      background-color:#422006 !important;
+    }
+    html.dark-mode .bg-red-50 {
+      background-color:#450a0a !important;
+    }
   </style>
 </head>
 <body class="bg-gray-50">
@@ -37,6 +90,8 @@
 
     // ---- Chat history persistence (localStorage) ----
     const STORAGE_KEY = "wb_chat_history:v1";
+    const THEME_KEY = "wb_theme";
+
     function loadHistory() {
       try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || []; }
       catch { return []; }
@@ -48,6 +103,16 @@
     function clearHistory() {
       try { localStorage.removeItem(STORAGE_KEY); }
       catch {}
+    }
+
+    function getInitialTheme() {
+      if (typeof window === "undefined") return "light";
+      try {
+        const stored = localStorage.getItem(THEME_KEY);
+        return stored === "dark" ? "dark" : "light";
+      } catch {
+        return "light";
+      }
     }
 
     // ---- Icons ----
@@ -86,6 +151,7 @@
 
     // ---- App ----
     const BuffettDigitalTwin = () => {
+      const [theme, setTheme] = useState(getInitialTheme);
       const [isAuthenticated, setIsAuthenticated] = useState(false);
       const [showIntro, setShowIntro] = useState(false);
       const [showLogin, setShowLogin] = useState(false);
@@ -102,9 +168,27 @@
       const [stockPrediction, setStockPrediction] = useState(null);
       const [isAnalyzing, setIsAnalyzing] = useState(false);
 
+      // Apply theme class to <html> + store
+      useEffect(() => {
+        if (typeof document === "undefined") return;
+        const root = document.documentElement;
+        if (theme === "dark") {
+          root.classList.add("dark-mode");
+        } else {
+          root.classList.remove("dark-mode");
+        }
+        try {
+          localStorage.setItem(THEME_KEY, theme);
+        } catch {}
+      }, [theme]);
+
       useEffect(() => {
         if (typeof lucide !== 'undefined') lucide.createIcons();
-      }, [activeTab, isAuthenticated, showLogin, showSignup, showIntro, messages, isTyping, stockPrediction]);
+      }, [activeTab, isAuthenticated, showLogin, showSignup, showIntro, messages, isTyping, stockPrediction, theme]);
+
+      const toggleTheme = () => {
+        setTheme((prev) => (prev === "light" ? "dark" : "light"));
+      };
 
       // Auth/demo
       const handleDemo = () => { setIsAuthenticated(true); setShowIntro(true); };
@@ -155,13 +239,15 @@
       };
 
       // ---- Chat -> /search ----
-      const handleSendMessage = async () => {
-        if (!inputMessage.trim()) return;
+      const handleSendMessage = async (overrideText) => {
+        const raw = overrideText !== undefined ? overrideText : inputMessage;
+        const trimmed = raw.trim();
+        if (!trimmed) return;
 
-        const userMessage = { id: (messages[messages.length - 1]?.id || 0) + 1, type: 'user', content: inputMessage };
+        const nextId = (messages[messages.length - 1]?.id || 0) + 1;
+        const userMessage = { id: nextId, type: 'user', content: trimmed };
         setMessages(prev => [...prev, userMessage]);
 
-        const q = inputMessage;
         setInputMessage('');
         setIsTyping(true);
 
@@ -169,22 +255,24 @@
           const res = await fetch(`${API_URL}/search`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ query: q })
+            body: JSON.stringify({ query: trimmed })
           });
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const data = await res.json();
 
-          const uniqueSources = Array.from(new Set((data.results || []).map(r => r.source).filter(Boolean)));
+          const uniqueSources = Array.from(
+            new Set((data.results || []).map(r => r.source).filter(Boolean))
+          );
 
           setMessages(prev => [...prev, {
-            id: userMessage.id + 1,
+            id: nextId + 1,
             type: 'assistant',
             content: data.answer || "(no answer)",
             sources: uniqueSources.length ? uniqueSources : undefined
           }]);
         } catch (e) {
           setMessages(prev => [...prev, {
-            id: userMessage.id + 1,
+            id: nextId + 1,
             type: 'assistant',
             content: `Sorry, I hit an error: ${e.message}. Is the API running at ${API_URL}?`,
             sources: []
@@ -194,14 +282,28 @@
         }
       };
 
+      const handleQuickAsk = (text) => {
+        if (isTyping) return;
+        handleSendMessage(text);
+      };
+
       // ---- Predictor -> /predict (company or ticker) ----
       const handleStockAnalysis = async () => {
         if (!stockQuery.trim()) return;
         setIsAnalyzing(true);
         setStockPrediction(null);
 
+        const q = stockQuery.trim();
+        const params = new URLSearchParams();
+        // If it looks like a ticker (ALL CAPS / numbers / dots / dashes, no spaces), treat as ticker
+        if (/^[A-Z0-9.\-]+$/.test(q) && !q.includes(' ')) {
+          params.set('ticker', q);
+        } else {
+          params.set('company', q);
+        }
+
         try {
-          const res = await fetch(`${API_URL}/predict?company=${encodeURIComponent(stockQuery.trim())}`);
+          const res = await fetch(`${API_URL}/predict?${params.toString()}`);
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const data = await res.json();
 
@@ -481,14 +583,25 @@
           {/* Main content */}
           <div className="flex-1 flex flex-col">
             <header className="bg-white shadow-sm border-b border-gray-200 p-4 flex items-center justify-between">
-              <h1 className="text-xl font-semibold text-gray-900">{activeTab==='chat' ? 'Chat with Warren' : 'Stock Predictor'}</h1>
+              <h1 className="text-xl font-semibold text-gray-900">
+                {activeTab==='chat' ? 'Chat with Warren' : 'Stock Predictor'}
+              </h1>
 
-              {activeTab==='chat' && (
-                <div className="flex gap-2">
-                  <button onClick={handleNewChat} className="px-3 py-1.5 text-sm rounded-lg border hover:bg-gray-50">New chat</button>
-                  <button onClick={handleClearHistory} className="px-3 py-1.5 text-sm rounded-lg border hover:bg-gray-50">Clear history</button>
-                </div>
-              )}
+              <div className="flex items-center gap-3">
+                {activeTab==='chat' && (
+                  <div className="flex gap-2">
+                    <button onClick={handleNewChat} className="px-3 py-1.5 text-sm rounded-lg border hover:bg-gray-50">New chat</button>
+                    <button onClick={handleClearHistory} className="px-3 py-1.5 text-sm rounded-lg border hover:bg-gray-50">Clear history</button>
+                  </div>
+                )}
+                <button
+                  onClick={toggleTheme}
+                  className="flex items-center gap-2 px-3 py-1.5 text-sm rounded-lg border hover:bg-gray-50"
+                >
+                  <Icon name={theme === "dark" ? "Sun" : "Moon"} className="w-4 h-4" />
+                  <span>{theme === "dark" ? "Light" : "Dark"} mode</span>
+                </button>
+              </div>
             </header>
 
             {/* Chat */}
@@ -498,13 +611,20 @@
                   {messages.map((m) => (
                     <div key={m.id} className={`flex ${m.type==='user'?'justify-end':'justify-start'}`}>
                       <div className={`max-w-3xl px-4 py-3 rounded-lg ${m.type==='user'?'bg-blue-600 text-white':'bg-white shadow-sm border border-gray-200'}`}>
+                        {m.type === 'assistant' && (
+                          <p className="text-xs font-semibold text-gray-500 mb-1">
+                            Warren Buffett
+                          </p>
+                        )}
                         <p className="text-sm leading-relaxed whitespace-pre-wrap">{m.content}</p>
                         {m.sources && m.sources.length > 0 && (
                           <div className="mt-3 pt-3 border-t border-gray-100">
                             <p className="text-xs text-gray-500 mb-1">Sources:</p>
                             <div className="flex flex-wrap gap-1">
                               {m.sources.map((s, i) => (
-                                <span key={i} className="text-xs bg-gray-100 text-gray-600 px-2 py-1 rounded-full">{s}</span>
+                                <span key={i} className="text-xs bg-gray-100 text-gray-600 px-2 py-1 rounded-full">
+                                  {s.replace(/^.*[\\/]/, '')}
+                                </span>
                               ))}
                             </div>
                           </div>
@@ -534,9 +654,29 @@
                       placeholder="Ask Warren about moats, capital allocation, valuation..."
                       className="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
                     />
-                    <button onClick={handleSendMessage} disabled={!inputMessage.trim()} className="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50">
+                    <button
+                      onClick={() => handleSendMessage()}
+                      disabled={!inputMessage.trim()}
+                      className="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50"
+                    >
                       <Icon name="Send" className="w-5 h-5"/>
                     </button>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-2 text-sm">
+                    {[
+                      "Explain moats with an example.",
+                      "How should a beginner start investing?",
+                      "What makes a business 'wonderful'?",
+                      "How do you think about diversification?"
+                    ].map((q, i) => (
+                      <button
+                        key={i}
+                        onClick={() => handleQuickAsk(q)}
+                        className="px-3 py-1.5 rounded-full border border-gray-200 text-gray-600 hover:bg-gray-50"
+                      >
+                        {q}
+                      </button>
+                    ))}
                   </div>
                 </div>
               </div>
@@ -559,10 +699,14 @@
                         value={stockQuery}
                         onChange={(e)=>setStockQuery(e.target.value)}
                         onKeyDown={(e)=>e.key==='Enter' && handleStockAnalysis()}
-                        placeholder="e.g., Apple  •  Tesla  •  Reliance"
+                        placeholder="e.g., AAPL  •  MSFT  •  Reliance"
                         className="flex-1 px-6 py-4 text-lg border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500"
                       />
-                      <button onClick={handleStockAnalysis} disabled={!stockQuery.trim() || isAnalyzing} className="bg-gradient-to-r from-blue-600 to-purple-600 text-white px-8 py-4 rounded-xl font-semibold hover:from-blue-700 hover:to-purple-700 transition-all duration-300 disabled:opacity-50">
+                      <button
+                        onClick={handleStockAnalysis}
+                        disabled={!stockQuery.trim() || isAnalyzing}
+                        className="bg-gradient-to-r from-blue-600 to-purple-600 text-white px-8 py-4 rounded-xl font-semibold hover:from-blue-700 hover:to-purple-700 transition-all duration-300 disabled:opacity-50"
+                      >
                         {isAnalyzing ? 'Analyzing...' : 'Analyze'}
                       </button>
                     </div>
@@ -575,7 +719,11 @@
                         <div>
                           <h2 className="text-2xl font-bold text-gray-900">
                             {stockPrediction.company}
-                            {stockPrediction.ticker ? <span className="ml-2 text-gray-500 text-lg">({stockPrediction.ticker}{stockPrediction.exchange ? ` • ${stockPrediction.exchange}` : ''})</span> : null}
+                            {stockPrediction.ticker ? (
+                              <span className="ml-2 text-gray-500 text-lg">
+                                ({stockPrediction.ticker}{stockPrediction.exchange ? ` • ${stockPrediction.exchange}` : ''})
+                              </span>
+                            ) : null}
                           </h2>
                           <div className={`inline-block px-4 py-2 rounded-full font-bold ${stockPrediction.bgColor} ${stockPrediction.predictionColor} mt-2`}>
                             {stockPrediction.prediction}
@@ -622,11 +770,26 @@
                       <div>
                         <h3 className="text-lg font-semibold mb-4">Financial Dashboard</h3>
                         <div className="grid grid-cols-5 gap-4">
-                          <div className="text-center"><div className="text-sm text-gray-500 mb-1">ROE</div><div className="text-xl font-bold">{stockPrediction.metrics.roe}</div></div>
-                          <div className="text-center"><div className="text-sm text-gray-500 mb-1">P/E Ratio</div><div className="text-xl font-bold">{stockPrediction.metrics.pe}</div></div>
-                          <div className="text-center"><div className="text-sm text-gray-500 mb-1">Debt/Equity</div><div className="text-xl font-bold">{stockPrediction.metrics.debtToEquity}</div></div>
-                          <div className="text-center"><div className="text-sm text-gray-500 mb-1">Growth</div><div className="text-xl font-bold">{stockPrediction.metrics.earningsGrowth}</div></div>
-                          <div className="text-center"><div className="text-sm text-gray-500 mb-1">Intrinsic Value</div><div className="text-xl font-bold">{stockPrediction.metrics.intrinsicValue}</div></div>
+                          <div className="text-center">
+                            <div className="text-sm text-gray-500 mb-1">ROE</div>
+                            <div className="text-xl font-bold">{stockPrediction.metrics.roe}</div>
+                          </div>
+                          <div className="text-center">
+                            <div className="text-sm text-gray-500 mb-1">P/E Ratio</div>
+                            <div className="text-xl font-bold">{stockPrediction.metrics.pe}</div>
+                          </div>
+                          <div className="text-center">
+                            <div className="text-sm text-gray-500 mb-1">Debt/Equity</div>
+                            <div className="text-xl font-bold">{stockPrediction.metrics.debtToEquity}</div>
+                          </div>
+                          <div className="text-center">
+                            <div className="text-sm text-gray-500 mb-1">Growth</div>
+                            <div className="text-xl font-bold">{stockPrediction.metrics.earningsGrowth}</div>
+                          </div>
+                          <div className="text-center">
+                            <div className="text-sm text-gray-500 mb-1">Intrinsic Value</div>
+                            <div className="text-xl font-bold">{stockPrediction.metrics.intrinsicValue}</div>
+                          </div>
                         </div>
                       </div>
                     </div>
