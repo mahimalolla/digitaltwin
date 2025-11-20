@@ -140,13 +140,13 @@ def _load_embeddings():
             docs.append(obj)
             embs.append(obj["embedding"])
     # Deferred import to avoid torch hard dep when not needed
-    import torch # type: ignore
+    import torch  # type: ignore
     corpus_embeddings = torch.tensor(embs, dtype=torch.float32) if embs else None
 
 # LLaMA (required for /search to answer)
-LLM_PATH = os.getenv("LLAMA_PATH", "model/llms/tinyllama-1.1b-chat-v1.0.Q2_K.gguf")
+LLM_PATH = os.getenv("LLAMA_PATH", "model/llms/Llama-3.2-3B-Instruct-Q4_K_L.gguf")
 CTX_SIZE = 2048
-MAX_NEW_TOKENS = 256
+MAX_NEW_TOKENS = 384
 TOKEN_CHAR_RATIO = 4.0
 SAFETY_MARGIN = 64
 
@@ -186,45 +186,123 @@ def _trim_context_for_ctx(query: str, context: str) -> str:
 
 def _llm_answer(prompt: str, max_tokens: int = MAX_NEW_TOKENS) -> str:
     if _llm is None:
-        raise HTTPException(status_code=503, detail=f"LLM not available at {LLM_PATH}: {_llm_err or 'init error'}")
-    out = _llm(prompt, max_tokens=max_tokens, temperature=0.2, stop=["</s>"])
+        raise HTTPException(
+            status_code=503,
+            detail=f"LLM not available at {LLM_PATH}: {_llm_err or 'init error'}",
+        )
+    out = _llm(
+        prompt,
+        max_tokens=max_tokens,
+        temperature=0.6,
+        top_p=0.9,
+        top_k=40,
+        repeat_penalty=1.1,
+        stop=["</s>"],
+    )
     return out["choices"][0]["text"].strip()
 
+
+
+def _clean_llm_answer(raw: str) -> str:
+    """
+    Clean up the raw LLM output:
+    - normalize whitespace
+    - cut off any trailing prompt-like instructions
+    """
+    if not raw:
+        return ""
+
+    # Collapse all whitespace/newlines into single spaces
+    text = " ".join(raw.split())
+    lower = text.lower()
+
+    # Any occurrence of these means the model started echoing instructions.
+    CUT_MARKERS = [
+        "this is a summary of your thoughts",
+        "speak in warren buffett",
+        "answer the question in clear, natural prose",
+        "answer the question in clear natural prose",
+        "aim for one or two paragraphs",
+        "do not use bullet points",
+        "do not repeat the question",
+        "just give the answer itself",
+        "requirements:",
+        "question:",
+        "answer:",
+    ]
+
+    for marker in CUT_MARKERS:
+        idx = lower.find(marker)
+        if idx != -1:
+            text = text[:idx].rstrip()
+            lower = text.lower()
+            break
+
+    return text
+
 def generate_answer(query: str, context: str) -> str:
+    """
+    Generate a Buffett-style answer, grounded in retrieved context
+    when available.
+    """
     trimmed = _trim_context_for_ctx(query, context or "")
-    prompt = f"""You are Warren Buffett's financial digital twin.
 
-Use the following context to answer concisely and cite key ideas when helpful.
+    if trimmed:
+        notes_block = f"""Here are background notes from Warren Buffett's shareholder letters, interviews, and writings. They may contain multiple snippets, sometimes from different years:
 
-Context:
 {trimmed}
 
-Question:
-{query}
+"""
+    else:
+        notes_block = ("There are no specific notes for this question. "
+                       "Answer using Warren Buffett's general investing philosophy, "
+                       "focusing on business quality, moats, management, and price.\n\n")
+
+    prompt = f"""You are Warren Buffett's financial digital twin.
+
+{notes_block}User question: {query}
+
+Write Warren Buffett's answer in 2–3 paragraphs of natural prose (about 120–220 words).
+
+Guidelines:
+- Speak in Buffett's calm, plain-English style, like in the Berkshire Hathaway annual letters.
+- Prefer explaining principles, trade-offs, and long-term thinking over hot takes.
+- When helpful, lightly reference the notes (e.g., "In one of my letters I wrote that...") but DO NOT quote them verbatim.
+- Do NOT mention that you were given notes or 'context'.
+- Do NOT use bullet points, numbered lists, headings, or Q&A labels like "Question:" or "Answer:".
+- Just give the final answer as if you are Buffett writing directly to a long-term shareholder.
 
 Answer:"""
+
     try:
-        return _llm_answer(prompt, MAX_NEW_TOKENS)
+        raw = _llm_answer(prompt, MAX_NEW_TOKENS)
     except Exception:
-        # last-ditch: shorten further
-        shorter = trimmed[: max(0, int(len(trimmed) * 0.6))]
-        prompt = prompt.replace(trimmed, shorter)
-        return _llm_answer(prompt, min(128, MAX_NEW_TOKENS))
+        raw = _llm_answer(prompt, min(128, MAX_NEW_TOKENS))
+
+    return _clean_llm_answer(raw)
+
 
 @app.post("/search")
 def search_chunks(query: QueryIn):
+    """
+    Main chat endpoint: takes a natural-language query,
+    runs (optional) semantic search, and returns Buffett-style answer + snippets.
+    """
+    # Make sure models are loaded
     _load_llm()
     _load_embeddings()
-    # If we have embeddings + sentence model, do retrieval; else answer without context
+
     context = ""
     top_results: List[Dict] = []
 
+    # If we have embeddings + sentence model, do retrieval; else answer without context
     if corpus_embeddings is not None and SentenceTransformer is not None:
         _load_sentence_model()
         if _st_model is not None and util is not None:
             try:
                 q_emb = _st_model.encode(query.query, convert_to_tensor=True)
                 hits = util.semantic_search(q_emb, corpus_embeddings, top_k=5)[0]
+
                 for h in hits:
                     idx = int(h["corpus_id"])
                     doc = docs[idx] if 0 <= idx < len(docs) else {"text": "", "source": ""}
@@ -233,14 +311,23 @@ def search_chunks(query: QueryIn):
                         "source": doc.get("source", ""),
                         "text": doc.get("text", "")
                     })
+
+                # Combine retrieved chunks into context
                 context = "\n".join(d["text"] for d in top_results if d.get("text"))
             except Exception:
-                # fall back to no-context if retrieval fails
+                # fall back to answering with no context if retrieval fails
                 top_results = []
                 context = ""
 
+    # Run LLM answer
     answer = generate_answer(query.query, context)
-    return {"query": query.query, "answer": answer, "results": top_results}
+
+    return {
+        "query": query.query,
+        "answer": answer,
+        "results": top_results,
+    }
+
 
 # ====================================================
 # Predictor helpers
@@ -632,4 +719,3 @@ def predict(
         "raw": {"price": metrics["price"], "intrinsicValue": metrics["intrinsicValue"], "marginPct": margin_pct},
         "priceHistory": price_history
     }
-
